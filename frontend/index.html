@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Log Intelligence Platform</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #c9d1d9;
+      --muted: #8b949e;
+      --accent: #58a6ff;
+      --info: #3fb950;
+      --warn: #d29922;
+      --error: #f85149;
+      --mono: "SF Mono", "Fira Code", "Cascadia Code", monospace;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 14px;
+      line-height: 1.5;
+      min-height: 100vh;
+    }
+
+    header {
+      border-bottom: 1px solid var(--border);
+      padding: 16px 24px;
+      background: var(--surface);
+    }
+
+    header h1 {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--accent);
+      margin-bottom: 8px;
+    }
+
+    .stats-bar {
+      display: flex;
+      gap: 24px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .stats-bar span { color: var(--text); }
+
+    main { max-width: 960px; margin: 0 auto; padding: 24px; }
+
+    .search-row {
+      display: flex;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+
+    #search-input {
+      flex: 1;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 14px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      outline: none;
+    }
+
+    #search-input:focus { border-color: var(--accent); }
+
+    button {
+      background: var(--accent);
+      color: #000;
+      border: none;
+      font-family: var(--mono);
+      font-size: 13px;
+      font-weight: 600;
+      padding: 10px 20px;
+      border-radius: 6px;
+      cursor: pointer;
+    }
+
+    button:hover { opacity: 0.85; }
+
+    .filters {
+      display: flex;
+      gap: 20px;
+      align-items: center;
+      margin-bottom: 20px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .filters label {
+      display: flex;
+      align-items: center;
+      gap: 4px;
+      cursor: pointer;
+    }
+
+    select {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 4px;
+    }
+
+    .meta {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    .results { list-style: none; }
+
+    .result {
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 12px 14px;
+      margin-bottom: 8px;
+      background: var(--surface);
+    }
+
+    .result-header {
+      display: flex;
+      gap: 10px;
+      align-items: center;
+      margin-bottom: 6px;
+      font-size: 12px;
+    }
+
+    .badge {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+
+    .badge.INFO { background: #23863633; color: var(--info); }
+    .badge.WARN { background: #9e6a0333; color: var(--warn); }
+    .badge.ERROR { background: #da363333; color: var(--error); }
+
+    .timestamp { color: var(--muted); }
+    .service { color: var(--accent); }
+    .score { color: var(--muted); margin-left: auto; }
+
+    .message { font-size: 13px; word-break: break-word; }
+
+    mark {
+      background: #58a6ff33;
+      color: var(--accent);
+      border-radius: 2px;
+      padding: 0 2px;
+    }
+
+    .empty {
+      text-align: center;
+      color: var(--muted);
+      padding: 40px;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>// log-intelligence</h1>
+    <div class="stats-bar">
+      <div>indexed: <span id="stat-indexed">—</span></div>
+      <div>dedup: <span id="stat-dedup">—</span></div>
+      <div>ingest: <span id="stat-ingest">—</span> evt/s</div>
+      <div>last query: <span id="stat-latency">—</span></div>
+    </div>
+  </header>
+
+  <main>
+    <div class="search-row">
+      <input id="search-input" type="text"
+             placeholder="Search logs… e.g. vandalism reverted on science articles"
+             autofocus />
+      <button id="search-btn">Search</button>
+    </div>
+
+    <div class="filters">
+      <span>severity:</span>
+      <label><input type="checkbox" name="severity" value="INFO" checked /> INFO</label>
+      <label><input type="checkbox" name="severity" value="WARN" checked /> WARN</label>
+      <label><input type="checkbox" name="severity" value="ERROR" checked /> ERROR</label>
+      <span style="margin-left:12px">window:</span>
+      <select id="time-window">
+        <option value="0.25">Last 15 min</option>
+        <option value="1">Last 1 hr</option>
+        <option value="2" selected>Last 2 hr</option>
+        <option value="6">Last 6 hr</option>
+        <option value="24">Last 24 hr</option>
+      </select>
+    </div>
+
+    <div class="meta" id="search-meta"></div>
+    <ul class="results" id="results"></ul>
+  </main>
+
+  <script>
+    const API = "/api";
+
+    async function fetchStats() {
+      try {
+        const [stats, health] = await Promise.all([
+          fetch(`${API}/stats`).then(r => r.json()),
+          fetch(`${API}/health`).then(r => r.json()),
+        ]);
+        document.getElementById("stat-indexed").textContent =
+          (stats.events_indexed || 0).toLocaleString();
+        document.getElementById("stat-dedup").textContent =
+          ((stats.dedup_ratio || 0) * 100).toFixed(1) + "%";
+        document.getElementById("stat-ingest").textContent =
+          (health.ingestion_rate_per_sec || 0).toFixed(1);
+      } catch (_) { /* API may not be ready yet */ }
+    }
+
+    function getSeverities() {
+      return [...document.querySelectorAll('input[name="severity"]:checked')]
+        .map(el => el.value);
+    }
+
+    function highlightTerms(text, query) {
+      const words = query.split(/\s+/).filter(w => w.length > 2);
+      if (!words.length) return text;
+      const pattern = new RegExp("(" + words.map(w =>
+        w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+      ).join("|") + ")", "gi");
+      return text.replace(pattern, "<mark>$1</mark>");
+    }
+
+    async function doSearch() {
+      const query = document.getElementById("search-input").value.trim();
+      if (!query) return;
+
+      const body = {
+        query,
+        time_window_hours: parseFloat(document.getElementById("time-window").value),
+        severity: getSeverities(),
+        limit: 20,
+      };
+
+      const meta = document.getElementById("search-meta");
+      const list = document.getElementById("results");
+      meta.textContent = "searching…";
+      list.innerHTML = "";
+
+      try {
+        const resp = await fetch(`${API}/search`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        const data = await resp.json();
+
+        document.getElementById("stat-latency").textContent = data.query_ms + "ms";
+        meta.textContent =
+          `${data.results.length} results · searched ${data.total_searched.toLocaleString()} vectors · ${data.query_ms}ms`;
+
+        if (!data.results.length) {
+          list.innerHTML = '<li class="empty">No results found.</li>';
+          return;
+        }
+
+        list.innerHTML = data.results.map(r => `
+          <li class="result">
+            <div class="result-header">
+              <span class="badge ${r.severity}">${r.severity}</span>
+              <span class="timestamp">${r.timestamp}</span>
+              <span class="service">${r.service}</span>
+              <span class="score">${r.score.toFixed(4)}</span>
+            </div>
+            <div class="message">${highlightTerms(r.message, query)}</div>
+          </li>
+        `).join("");
+      } catch (err) {
+        meta.textContent = "Search failed — is the API running?";
+      }
+    }
+
+    document.getElementById("search-btn").addEventListener("click", doSearch);
+    document.getElementById("search-input").addEventListener("keydown", e => {
+      if (e.key === "Enter") doSearch();
+    });
+
+    fetchStats();
+    setInterval(fetchStats, 5000);
+  </script>
+</body>
+</html>

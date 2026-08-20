@@ -148,6 +148,23 @@
     .badge.WARN { background: #9e6a0333; color: var(--warn); }
     .badge.ERROR { background: #da363333; color: var(--error); }
 
+    .badge.source {
+      background: #388bfd22;
+      color: #79c0ff;
+      text-transform: lowercase;
+    }
+
+    .source-stats {
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-top: 6px;
+      font-size: 11px;
+    }
+
+    .source-stats span { color: var(--muted); }
+    .source-stats .count { color: var(--text); }
+
     .timestamp { color: var(--muted); }
     .service { color: var(--accent); }
     .score { color: var(--muted); margin-left: auto; }
@@ -177,6 +194,7 @@
       <div>ingest: <span id="stat-ingest">—</span> evt/s</div>
       <div>last query: <span id="stat-latency">—</span></div>
     </div>
+    <div class="source-stats" id="source-stats"></div>
   </header>
 
   <main>
@@ -192,6 +210,10 @@
       <label><input type="checkbox" name="severity" value="INFO" checked /> INFO</label>
       <label><input type="checkbox" name="severity" value="WARN" checked /> WARN</label>
       <label><input type="checkbox" name="severity" value="ERROR" checked /> ERROR</label>
+      <span style="margin-left:12px">stream:</span>
+      <label><input type="checkbox" name="source" value="wikimedia" checked /> wikimedia</label>
+      <label><input type="checkbox" name="source" value="mastodon" checked /> mastodon</label>
+      <label><input type="checkbox" name="source" value="webhook" checked /> webhook</label>
       <span style="margin-left:12px">window:</span>
       <select id="time-window">
         <option value="0.25">Last 15 min</option>
@@ -208,6 +230,7 @@
 
   <script>
     const API = "/api";
+    const ALL_SOURCES = ["wikimedia", "mastodon", "webhook"];
 
     async function fetchStats() {
       try {
@@ -221,12 +244,32 @@
           ((stats.dedup_ratio || 0) * 100).toFixed(1) + "%";
         document.getElementById("stat-ingest").textContent =
           (health.ingestion_rate_per_sec || 0).toFixed(1);
+
+        const bySource = stats.by_source || {};
+        const el = document.getElementById("source-stats");
+        const parts = ALL_SOURCES.map(src => {
+          const count = parseInt(bySource[src] || "0", 10);
+          return `<span>${src}: <span class="count">${count.toLocaleString()}</span></span>`;
+        });
+        const legacy = (stats.events_indexed || 0) -
+          ALL_SOURCES.reduce((n, src) => n + parseInt(bySource[src] || "0", 10), 0);
+        if (legacy > 0) {
+          parts.push(`<span>legacy: <span class="count">${legacy.toLocaleString()}</span></span>`);
+        }
+        el.innerHTML = parts.join("");
       } catch (_) { /* API may not be ready yet */ }
     }
 
     function getSeverities() {
       return [...document.querySelectorAll('input[name="severity"]:checked')]
         .map(el => el.value);
+    }
+
+    function getSources() {
+      const checked = [...document.querySelectorAll('input[name="source"]:checked')]
+        .map(el => el.value);
+      if (checked.length === ALL_SOURCES.length) return null;
+      return checked;
     }
 
     function highlightTerms(text, query) {
@@ -242,12 +285,22 @@
       const query = document.getElementById("search-input").value.trim();
       if (!query) return;
 
+      const sources = getSources();
+      if (sources && sources.length === 0) {
+        document.getElementById("search-meta").textContent =
+          "Select at least one stream to search.";
+        document.getElementById("results").innerHTML =
+          '<li class="empty">No streams selected.</li>';
+        return;
+      }
+
       const body = {
         query,
         time_window_hours: parseFloat(document.getElementById("time-window").value),
         severity: getSeverities(),
         limit: 20,
       };
+      if (sources) body.sources = sources;
 
       const meta = document.getElementById("search-meta");
       const list = document.getElementById("results");
@@ -275,6 +328,7 @@
           <li class="result">
             <div class="result-header">
               <span class="badge ${r.severity}">${r.severity}</span>
+              <span class="badge source">${r.source || "unknown"}</span>
               <span class="timestamp">${r.timestamp}</span>
               <span class="service">${r.service}</span>
               <span class="score">${r.score.toFixed(4)}</span>

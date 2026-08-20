@@ -26,7 +26,11 @@ services:
       start_period: 10s
 
   ingester:
-    build: ./ingester
+    build:
+      context: .
+      dockerfile: ingester/Dockerfile
+    ports:
+      - "8081:8081"
     depends_on:
       redis:
         condition: service_healthy
@@ -37,7 +41,9 @@ services:
     restart: unless-stopped
 
   processor:
-    build: ./processor
+    build:
+      context: .
+      dockerfile: processor/Dockerfile
     depends_on:
       redis:
         condition: service_healthy
@@ -51,7 +57,9 @@ services:
     restart: unless-stopped
 
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     ports:
       - "8000:8000"
     depends_on:

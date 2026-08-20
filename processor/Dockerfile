@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY processor/requirements.txt ./requirements.txt
 
 # PyStemmer (fastembed dep) compiles from source on aarch64; use CPU-only torch.
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py .
+COPY shared ./shared
+COPY processor ./processor
 
-CMD ["python", "-u", "main.py"]
+ENV PYTHONPATH=/app
+CMD ["python", "-u", "processor/main.py"]

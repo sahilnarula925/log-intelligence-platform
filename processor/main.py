@@ -1,4 +1,4 @@
-"""Stream processor — deduplication, embedding, and Qdrant indexing."""
+"""Stream processor — deduplication, embedding, and time-partitioned Qdrant indexing."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import re
 import time
 import uuid
 from functools import partial
@@ -27,24 +26,15 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
+from shared.events import redis_fields_to_event
+from shared.partitions import collection_name
+from shared.templates import extract_template
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [processor] %(levelname)s %(message)s",
 )
 logger = logging.getLogger(__name__)
-
-# Strip variable parts from log messages to find structural templates.
-# Example: "Alice edited Python: +42 bytes" -> "<user> edited <page>: <delta> bytes"
-TEMPLATE_PATTERN = re.compile(
-    r"^(.+?) edited (.+?): \+(\d+) bytes$"
-)
-
-
-def extract_template(message: str) -> str:
-    match = TEMPLATE_PATTERN.match(message)
-    if match:
-        return "<user> edited <page>: <delta> bytes"
-    return message
 
 
 def template_hash(template: str) -> str:
@@ -52,7 +42,6 @@ def template_hash(template: str) -> str:
 
 
 def event_id_to_uuid(event_id: str) -> str:
-    """Qdrant accepts UUID point IDs; derive one from the sha256 event hash."""
     return str(uuid.UUID(event_id[:32]))
 
 
@@ -61,12 +50,17 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
-    qdrant_collection: str = "logs"
+    qdrant_collection_prefix: str = "logs"
+    partition_granularity: str = "hour"
     redis_stream_key: str = "logs:raw"
+    retry_stream_key: str = "logs:retry"
+    dlq_stream_key: str = "logs:dlq"
     consumer_group: str = "processors"
     consumer_name: str = "processor-1"
+    retry_consumer_group: str = "processors-retry"
     batch_size: int = 50
     embed_batch_size: int = 32
+    max_retries: int = 5
     dedup_set_key: str = "seen:templates"
     vector_cache_key: str = "cache:vectors"
     embedding_model: str = "all-MiniLM-L6-v2"
@@ -82,6 +76,7 @@ class Processor:
         self.sparse_model: SparseTextEmbedding | None = None
         self.total_processed = 0
         self.dedup_hits = 0
+        self._known_collections: set[str] = set()
 
     async def connect(self) -> None:
         self.redis = aioredis.from_url(
@@ -90,9 +85,7 @@ class Processor:
         await self.redis.ping()
 
         self.qdrant = AsyncQdrantClient(url=self.settings.qdrant_url)
-        await self.ensure_collection()
 
-        # Load models in a thread to avoid blocking the event loop.
         loop = asyncio.get_event_loop()
         self.dense_model = await loop.run_in_executor(
             None, SentenceTransformer, self.settings.embedding_model
@@ -103,47 +96,47 @@ class Processor:
         )
         logger.info("Models loaded")
 
-        await self.ensure_consumer_group()
+        await self.ensure_consumer_groups()
 
-    async def ensure_collection(self) -> None:
-        assert self.qdrant is not None
-        collections = await self.qdrant.get_collections()
-        names = {c.name for c in collections.collections}
-        if self.settings.qdrant_collection not in names:
-            await self.qdrant.create_collection(
-                collection_name=self.settings.qdrant_collection,
-                vectors_config={
-                    "dense": VectorParams(size=384, distance=Distance.COSINE),
-                },
-                sparse_vectors_config={
-                    "sparse": SparseVectorParams(index=SparseIndexParams(on_disk=False)),
-                },
-            )
-            logger.info("Created Qdrant collection '%s'", self.settings.qdrant_collection)
-
-    async def ensure_consumer_group(self) -> None:
+    async def ensure_consumer_group(self, stream_key: str, group: str) -> None:
         assert self.redis is not None
         try:
-            await self.redis.xgroup_create(
-                self.settings.redis_stream_key,
-                self.settings.consumer_group,
-                id="0",
-                mkstream=True,
-            )
-            logger.info("Created consumer group '%s'", self.settings.consumer_group)
+            await self.redis.xgroup_create(stream_key, group, id="0", mkstream=True)
+            logger.info("Created consumer group '%s' on '%s'", group, stream_key)
         except aioredis.ResponseError as exc:
             if "BUSYGROUP" not in str(exc):
                 raise
 
-    def parse_stream_entry(self, fields: dict[str, str]) -> dict[str, Any]:
-        return {
-            "id": fields["id"],
-            "timestamp": datetime.fromisoformat(fields["timestamp"]),
-            "service": fields["service"],
-            "severity": fields["severity"],
-            "message": fields["message"],
-            "raw": json.loads(fields.get("raw", "{}")),
-        }
+    async def ensure_consumer_groups(self) -> None:
+        await self.ensure_consumer_group(
+            self.settings.redis_stream_key, self.settings.consumer_group
+        )
+        await self.ensure_consumer_group(
+            self.settings.retry_stream_key, self.settings.retry_consumer_group
+        )
+
+    async def ensure_collection(self, name: str) -> None:
+        assert self.qdrant is not None
+        if name in self._known_collections:
+            return
+
+        collections = await self.qdrant.get_collections()
+        existing = {c.name for c in collections.collections}
+        if name not in existing:
+            await self.qdrant.create_collection(
+                collection_name=name,
+                vectors_config={
+                    "dense": VectorParams(size=384, distance=Distance.COSINE),
+                },
+                sparse_vectors_config={
+                    "sparse": SparseVectorParams(
+                        index=SparseIndexParams(on_disk=False)
+                    ),
+                },
+            )
+            logger.info("Created Qdrant collection '%s'", name)
+
+        self._known_collections.add(name)
 
     async def get_cached_vector(self, tmpl_hash: str) -> list[float] | None:
         assert self.redis is not None
@@ -168,7 +161,9 @@ class Processor:
 
     def embed_dense_batch(self, texts: list[str]) -> list[list[float]]:
         assert self.dense_model is not None
-        vectors = self.dense_model.encode(texts, batch_size=self.settings.embed_batch_size)
+        vectors = self.dense_model.encode(
+            texts, batch_size=self.settings.embed_batch_size
+        )
         return [v.tolist() for v in vectors]
 
     def embed_sparse(self, text: str) -> SparseVector:
@@ -179,14 +174,48 @@ class Processor:
             values=result.values.tolist(),
         )
 
+    async def enqueue_retry(
+        self,
+        stream_key: str,
+        group: str,
+        messages: list[tuple[str, dict[str, str]]],
+    ) -> None:
+        assert self.redis is not None
+
+        for msg_id, fields in messages:
+            retry_count = int(fields.get("retry_count", "0")) + 1
+            if retry_count > self.settings.max_retries:
+                dlq_fields = dict(fields)
+                dlq_fields["retry_count"] = str(retry_count)
+                dlq_fields["failed_from"] = stream_key
+                dlq_fields["original_msg_id"] = msg_id
+                await self.redis.xadd(self.settings.dlq_stream_key, dlq_fields)
+                await self.redis.hincrby("stats:dlq_total", "count", 1)
+                logger.warning(
+                    "Moved message to DLQ after %d attempts (id=%s)",
+                    retry_count,
+                    fields.get("id", "?"),
+                )
+            else:
+                retry_fields = dict(fields)
+                retry_fields["retry_count"] = str(retry_count)
+                retry_fields["retry_after"] = str(
+                    int(time.time()) + min(2 ** retry_count, 60)
+                )
+                await self.redis.xadd(self.settings.retry_stream_key, retry_fields)
+                await self.redis.hincrby("stats:retry_total", "count", 1)
+
+            await self.redis.xack(stream_key, group, msg_id)
+
     async def process_batch(self, messages: list[tuple[str, dict[str, str]]]) -> None:
         assert self.redis is not None and self.qdrant is not None
 
-        events = [self.parse_stream_entry(fields) for _, fields in messages]
-        templates = [extract_template(e["message"]) for e in events]
+        events = [redis_fields_to_event(fields) for _, fields in messages]
+        templates = [
+            extract_template(e["message"], e.get("source", "unknown")) for e in events
+        ]
         tmpl_hashes = [template_hash(t) for t in templates]
 
-        # Step A — deduplication: identify which templates need fresh embeddings.
         needs_embed: list[tuple[int, str, str]] = []
         dense_vectors: list[list[float] | None] = [None] * len(events)
 
@@ -203,7 +232,6 @@ class Processor:
                 await self.mark_template_seen(th)
                 needs_embed.append((i, tmpl, th))
 
-        # Step B — batch embed unique templates that aren't cached yet.
         if needs_embed:
             unique: dict[str, tuple[str, list[int]]] = {}
             for idx, tmpl, th in needs_embed:
@@ -229,88 +257,146 @@ class Processor:
                 for idx in indices:
                     dense_vectors[idx] = vec
 
-        # Step C — index into Qdrant (sparse regenerated per event even on dedup).
-        points: list[PointStruct] = []
+        points_by_collection: dict[str, list[PointStruct]] = {}
         for event, tmpl, th, dense in zip(events, templates, tmpl_hashes, dense_vectors):
             if dense is None:
                 continue
-            sparse = self.embed_sparse(event["message"])
+
             ts: datetime = event["timestamp"]
-            points.append(
-                PointStruct(
-                    id=event_id_to_uuid(event["id"]),
-                    vector={"dense": dense, "sparse": sparse},
-                    payload={
-                        "timestamp": ts.isoformat(),
-                        "timestamp_hour": ts.hour,
-                        "service": event["service"],
-                        "severity": event["severity"],
-                        "message": event["message"],
-                        "template_hash": th,
-                    },
-                )
+            coll = collection_name(
+                self.settings.qdrant_collection_prefix,
+                ts,
+                self.settings.partition_granularity,
             )
+            await self.ensure_collection(coll)
 
-        if points:
-            await self.qdrant.upsert(
-                collection_name=self.settings.qdrant_collection,
-                points=points,
+            sparse = self.embed_sparse(event["message"])
+            point = PointStruct(
+                id=event_id_to_uuid(event["id"]),
+                vector={"dense": dense, "sparse": sparse},
+                payload={
+                    "timestamp": ts.isoformat(),
+                    "partition": collection_name(
+                        self.settings.qdrant_collection_prefix,
+                        ts,
+                        self.settings.partition_granularity,
+                    ).removeprefix(f"{self.settings.qdrant_collection_prefix}_"),
+                    "service": event["service"],
+                    "severity": event["severity"],
+                    "message": event["message"],
+                    "source": event.get("source", "unknown"),
+                    "template_hash": th,
+                },
             )
+            points_by_collection.setdefault(coll, []).append(point)
 
-        # ACK all messages in the batch.
-        for msg_id, _ in messages:
-            await self.redis.xack(
-                self.settings.redis_stream_key,
-                self.settings.consumer_group,
-                msg_id,
-            )
+        for coll, points in points_by_collection.items():
+            await self.qdrant.upsert(collection_name=coll, points=points)
 
         self.total_processed += len(messages)
         await self.redis.set("stats:total_processed", self.total_processed)
         await self.redis.set("stats:dedup_hits_total", self.dedup_hits)
 
-    async def read_batch(self) -> list[tuple[str, dict[str, str]]]:
+    async def read_batch(
+        self,
+        stream_key: str,
+        group: str,
+        *,
+        retry_mode: bool = False,
+    ) -> list[tuple[str, dict[str, str]]]:
         assert self.redis is not None
         result = await self.redis.xreadgroup(
-            groupname=self.settings.consumer_group,
+            groupname=group,
             consumername=self.settings.consumer_name,
-            streams={self.settings.redis_stream_key: ">"},
+            streams={stream_key: ">"},
             count=self.settings.batch_size,
-            block=5000,
+            block=2000 if retry_mode else 5000,
         )
         if not result:
             return []
 
+        now = int(time.time())
         messages: list[tuple[str, dict[str, str]]] = []
+        deferred: list[tuple[str, dict[str, str]]] = []
+
         for _, entries in result:
             for msg_id, fields in entries:
+                if retry_mode:
+                    retry_after = int(fields.get("retry_after", "0"))
+                    if retry_after > now:
+                        deferred.append((msg_id, fields))
+                        continue
                 messages.append((msg_id, fields))
+
+        # Re-enqueue deferred retry messages so they aren't stuck in pending forever.
+        for msg_id, fields in deferred:
+            await self.redis.xack(stream_key, group, msg_id)
+            await self.redis.xadd(stream_key, fields)
+
         return messages
+
+    async def handle_batch(
+        self,
+        stream_key: str,
+        group: str,
+        messages: list[tuple[str, dict[str, str]]],
+    ) -> None:
+        assert self.redis is not None
+        try:
+            await self.process_batch(messages)
+            for msg_id, _ in messages:
+                await self.redis.xack(stream_key, group, msg_id)
+        except Exception:
+            logger.exception(
+                "Batch processing failed (%d messages), enqueueing retry",
+                len(messages),
+            )
+            await self.enqueue_retry(stream_key, group, messages)
+            await asyncio.sleep(1)
 
     async def run(self) -> None:
         await self.connect()
         logger.info("Processor started, waiting for events...")
 
         while True:
-            batch = await self.read_batch()
+            # Prefer retry queue when it has work.
+            retry_batch = await self.read_batch(
+                self.settings.retry_stream_key,
+                self.settings.retry_consumer_group,
+                retry_mode=True,
+            )
+            if retry_batch:
+                await self.handle_batch(
+                    self.settings.retry_stream_key,
+                    self.settings.retry_consumer_group,
+                    retry_batch,
+                )
+                continue
+
+            batch = await self.read_batch(
+                self.settings.redis_stream_key,
+                self.settings.consumer_group,
+            )
             if not batch:
                 continue
-            try:
-                await self.process_batch(batch)
-                if self.total_processed % 500 == 0:
-                    ratio = (
-                        self.dedup_hits / self.total_processed * 100
-                        if self.total_processed
-                        else 0
-                    )
-                    logger.info(
-                        "processed=%d dedup=%.1f%%",
-                        self.total_processed,
-                        ratio,
-                    )
-            except Exception:
-                logger.exception("Batch processing failed")
-                await asyncio.sleep(1)
+
+            await self.handle_batch(
+                self.settings.redis_stream_key,
+                self.settings.consumer_group,
+                batch,
+            )
+
+            if self.total_processed and self.total_processed % 500 == 0:
+                ratio = (
+                    self.dedup_hits / self.total_processed * 100
+                    if self.total_processed
+                    else 0
+                )
+                logger.info(
+                    "processed=%d dedup=%.1f%%",
+                    self.total_processed,
+                    ratio,
+                )
 
 
 async def main() -> None:

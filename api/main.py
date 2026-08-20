@@ -27,6 +27,8 @@ from qdrant_client.models import (
 )
 from sentence_transformers import SentenceTransformer
 
+from shared.partitions import collection_names_for_window
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -37,7 +39,8 @@ class Settings(BaseSettings):
 
     redis_url: str = "redis://localhost:6379/0"
     qdrant_url: str = "http://localhost:6333"
-    qdrant_collection: str = "logs"
+    qdrant_collection_prefix: str = "logs"
+    partition_granularity: str = "hour"
     embedding_model: str = "all-MiniLM-L6-v2"
     sparse_model: str = "Qdrant/bm42-all-minilm-l6-v2-attentions"
     rrf_k: int = 60
@@ -57,6 +60,7 @@ class SearchRequest(BaseModel):
     query: str
     time_window_hours: float = 2
     severity: list[str] = Field(default_factory=lambda: ["INFO", "WARN", "ERROR"])
+    sources: list[str] | None = None
     limit: int = 20
 
 
@@ -64,6 +68,7 @@ class SearchResult(BaseModel):
     message: str
     service: str
     severity: str
+    source: str
     timestamp: str
     score: float
 
@@ -123,18 +128,24 @@ app.add_middleware(
 
 def build_filter(req: SearchRequest) -> Filter:
     cutoff = datetime.now(timezone.utc) - timedelta(hours=req.time_window_hours)
-    return Filter(
-        must=[
+    conditions = [
+        FieldCondition(
+            key="timestamp",
+            range=DatetimeRange(gte=cutoff.isoformat()),
+        ),
+        FieldCondition(
+            key="severity",
+            match=MatchAny(any=req.severity),
+        ),
+    ]
+    if req.sources:
+        conditions.append(
             FieldCondition(
-                key="timestamp",
-                range=DatetimeRange(gte=cutoff.isoformat()),
-            ),
-            FieldCondition(
-                key="severity",
-                match=MatchAny(any=req.severity),
-            ),
-        ]
-    )
+                key="source",
+                match=MatchAny(any=req.sources),
+            )
+        )
+    return Filter(must=conditions)
 
 
 def reciprocal_rank_fusion(
@@ -175,6 +186,78 @@ def embed_query_sparse(query: str) -> SparseVector:
     )
 
 
+async def indexed_collections() -> list[str]:
+    """All Qdrant collections that hold indexed logs (partitions + legacy)."""
+    prefix = settings.qdrant_collection_prefix
+    all_collections = await state.qdrant.get_collections()
+    names: list[str] = []
+    for coll in all_collections.collections:
+        if coll.name.startswith(f"{prefix}_") or coll.name == prefix:
+            names.append(coll.name)
+    return names
+
+
+async def collections_for_window(hours: float) -> list[str]:
+    """Return collections to search for the requested time window."""
+    candidates = collection_names_for_window(
+        settings.qdrant_collection_prefix,
+        hours,
+        settings.partition_granularity,
+    )
+    all_collections = await state.qdrant.get_collections()
+    existing = {c.name for c in all_collections.collections}
+    names = [name for name in candidates if name in existing]
+    legacy = settings.qdrant_collection_prefix
+    if legacy in existing and legacy not in names:
+        names.append(legacy)
+    return names
+
+
+async def total_index_size() -> int:
+    total = 0
+    for name in await indexed_collections():
+        coll = await state.qdrant.get_collection(name)
+        total += coll.points_count or 0
+    return total
+
+
+async def search_partitions(
+    collections: list[str],
+    dense_vec: list[float],
+    sparse_vec: SparseVector,
+    query_filter: Filter,
+    limit: int,
+) -> tuple[list[Any], list[Any]]:
+    if not collections:
+        return [], []
+
+    async def dense_search(name: str) -> list[Any]:
+        return await state.qdrant.search(
+            collection_name=name,
+            query_vector=NamedVector(name="dense", vector=dense_vec),
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
+
+    async def sparse_search(name: str) -> list[Any]:
+        return await state.qdrant.search(
+            collection_name=name,
+            query_vector=NamedSparseVector(name="sparse", vector=sparse_vec),
+            query_filter=query_filter,
+            limit=limit,
+            with_payload=True,
+        )
+
+    dense_batches, sparse_batches = await asyncio.gather(
+        asyncio.gather(*(dense_search(name) for name in collections)),
+        asyncio.gather(*(sparse_search(name) for name in collections)),
+    )
+    dense_hits = [hit for batch in dense_batches for hit in batch]
+    sparse_hits = [hit for batch in sparse_batches for hit in batch]
+    return dense_hits, sparse_hits
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -187,8 +270,7 @@ async def health() -> dict[str, Any]:
     dedup_hits = int(await state.redis.get("stats:dedup_hits_total") or 0)
     dedup_ratio = dedup_hits / total_processed if total_processed else 0.0
 
-    collection = await state.qdrant.get_collection(settings.qdrant_collection)
-    index_size = collection.points_count or 0
+    index_size = await total_index_size()
 
     # Ingestion rate from last minute bucket.
     minute_key = str(int(time.time()) // 60)
@@ -214,35 +296,26 @@ async def search(req: SearchRequest) -> SearchResponse:
     sparse_vec = await loop.run_in_executor(None, embed_query_sparse, req.query)
 
     fetch_limit = max(req.limit * 3, 60)
-
-    dense_hits, sparse_hits = await asyncio.gather(
-        state.qdrant.search(
-            collection_name=settings.qdrant_collection,
-            query_vector=NamedVector(name="dense", vector=dense_vec),
-            query_filter=query_filter,
-            limit=fetch_limit,
-            with_payload=True,
-        ),
-        state.qdrant.search(
-            collection_name=settings.qdrant_collection,
-            query_vector=NamedSparseVector(name="sparse", vector=sparse_vec),
-            query_filter=query_filter,
-            limit=fetch_limit,
-            with_payload=True,
-        ),
+    collections = await collections_for_window(req.time_window_hours)
+    dense_hits, sparse_hits = await search_partitions(
+        collections,
+        dense_vec,
+        sparse_vec,
+        query_filter,
+        fetch_limit,
     )
 
     fused = reciprocal_rank_fusion(dense_hits, sparse_hits, k=settings.rrf_k)
     top = fused[: req.limit]
 
-    collection = await state.qdrant.get_collection(settings.qdrant_collection)
-    total_searched = collection.points_count or 0
+    total_searched = await total_index_size()
 
     results = [
         SearchResult(
             message=p.get("message", ""),
             service=p.get("service", ""),
             severity=p.get("severity", ""),
+            source=p.get("source", "unknown"),
             timestamp=p.get("timestamp", ""),
             score=round(score, 4),
         )
@@ -283,10 +356,9 @@ async def stats() -> dict[str, Any]:
     dedup_hits = int(await state.redis.get("stats:dedup_hits_total") or 0)
     dedup_ratio = dedup_hits / total_processed if total_processed else 0.0
 
-    collection = await state.qdrant.get_collection(settings.qdrant_collection)
-
     return {
         "series": series,
-        "events_indexed": collection.points_count or 0,
+        "events_indexed": await total_index_size(),
         "dedup_ratio": round(dedup_ratio, 4),
+        "by_source": await state.redis.hgetall("stats:ingestion_by_source"),
     }

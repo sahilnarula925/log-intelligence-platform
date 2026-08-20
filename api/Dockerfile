@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY requirements.txt .
+COPY api/requirements.txt ./requirements.txt
 
 # PyStemmer (fastembed dep) compiles from source on aarch64; use CPU-only torch.
 RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
@@ -12,7 +12,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends gcc g++ \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
-COPY main.py .
+COPY shared ./shared
+COPY api ./api
 
+ENV PYTHONPATH=/app
 EXPOSE 8000
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
